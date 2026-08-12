@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The TileOPs dev image carries the pinned torch / CUDA / tilelang stack, so nothing
+    # has to be resolved here. No GPU on this runner: the tests that need a CUDA driver
+    # skip themselves, and they are the ones exercising TileOPs' own platform assumptions
+    # rather than this backend. See tests/conftest.py.
+    container: ghcr.io/tile-ai/tileops-runner:cu132-torch2.13-tl-afcebed1-dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out TileOPs
+        uses: actions/checkout@v4
+        with:
+          repository: tile-ai/TileOPs
+          path: .tileops
+
+      # --no-deps throughout: the image already carries the stack, and letting pip resolve
+      # would replace it.
+      - name: Install TileOPs
+        run: pip install -e .tileops --no-deps
+
+      - name: Install this backend
+        run: pip install -e . --no-deps
+
+      - name: The backend is discovered through its entry point alone
+        run: |
+          python -c "
+          from tileops.backend import load_failures, registered_targets
+          from tileops.ops.norm.rms_norm import RMSNormFwdOp
+          RMSNormFwdOp(normalized_shape=(64,))   # discovery happens here
+          assert 'torch_cpu' in registered_targets(), registered_targets()
+          assert not load_failures(), load_failures()
+          "
+
+      - name: Test
+        run: python -m pytest -v
+
+      - name: Uninstalling it undoes the whole thing
+        run: |
+          pip uninstall -y tileops-cpu
+          python -c "
+          from tileops.backend import registered_targets
+          from tileops.ops.norm.rms_norm import RMSNormFwdOp
+          RMSNormFwdOp(normalized_shape=(64,))
+          assert registered_targets() == [], registered_targets()
+          "

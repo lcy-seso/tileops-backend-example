@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tileops-cpu"
+version = "0.1.0"
+description = "A TileOPs backend, in full, in pure PyTorch: the reference an external backend author copies."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+# torch only. `tileops` is deliberately absent: this package extends an installation that
+# already exists, and pinning a floor here would resolve a release that predates
+# `tileops.backend` — the resulting ImportError is swallowed into load_failures() and
+# reads as "this backend is broken" rather than "TileOPs is too old". See README.
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Repository = "https://github.com/lcy-seso/tileops-backend-example"
+
+# The whole install mechanism. The value names a module; importing it must perform the
+# registration. TileOPs enumerates this group when the first Op is constructed.
+[project.entry-points."tileops.backends"]
+torch_cpu = "tileops_cpu"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
