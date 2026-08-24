@@ -12,8 +12,8 @@ distinct input signature.
 
 from tileops.backend import TensorSpec, register_detector, register_kernel_builder
 
+from .gemm import build_gemm
 from .kernels import CpuRMSNorm
-from .pending import build_gemm
 
 #: The name this distribution gives its set of kernels. Chosen, not derived: a target name
 #: is not a ``torch.device.type``. One torch type can cover several vendors' kernels, and
@@ -21,7 +21,7 @@ from .pending import build_gemm
 #: below is where the device question gets answered.
 TARGET = "torch_cpu"
 
-__all__ = ["TARGET", "build_rms_norm"]
+__all__ = ["TARGET", "build_gemm", "build_rms_norm"]
 
 
 def _detect(device) -> bool:
@@ -60,7 +60,7 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
 
 register_detector(target=TARGET, detect=_detect)
-register_kernel_builder(op="RMSNormFwdOp", target=TARGET, build_kernel=build_rms_norm)
 
-# Registered, but unreachable today — see pending.py for why, and what has to change.
-register_kernel_builder(op="GemmOp", target=TARGET, build_kernel=build_gemm)
+# One registration per op taken over, under the name the manifest gives the op.
+register_kernel_builder(op="RMSNormFwdOp", target=TARGET, build_kernel=build_rms_norm)
+register_kernel_builder(op="GemmFwdOp", target=TARGET, build_kernel=build_gemm)

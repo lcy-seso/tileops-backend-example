@@ -26,9 +26,9 @@ $ python -c "...同一段代码..."
 <li><a href="#s4">4. build_kernel 的签名与参数</a></li>
 <li><a href="#s5">5. op 层已经完成的工作</a></li>
 <li><a href="#s6">6. 何时重新调用 build_kernel</a></li>
-<li><a href="#s7">7. 安装后 op 的三种状态</a>
+<li><a href="#s7">7. 安装后 op 的两种状态</a>
   <ul>
-    <li><a href="#s7-1">7.1 接缝之前的平台判据</a></li>
+    <li><a href="#s7-1">7.1 target 定下来之前的硬件查询</a></li>
   </ul>
 </li>
 <li><a href="#s8">8. 错误信息对照</a></li>
@@ -43,17 +43,18 @@ $ python -c "...同一段代码..."
 
 ## <a id="s1"></a>1. 最小实现
 
-一个后端需要提供的全部内容如下。`pyproject.toml` 中三行:
+一个后端需要提供的内容只有两处。第一处是 `pyproject.toml` 里的三行:
 
 ```toml
 [project.entry-points."tileops.backends"]
 torch_cpu = "tileops_cpu"
 ```
 
-以及模块顶层的两次注册:
+第二处是模块顶层的注册:一次 `register_detector`,再为每个要接管的 op 各一次 `register_kernel_builder`。
 
 ```python
 from tileops.backend import TensorSpec, register_detector, register_kernel_builder
+from .gemm import build_gemm
 from .kernels import CpuRMSNorm
 
 register_detector(target="torch_cpu", detect=lambda device: device.type == "cpu")
@@ -64,9 +65,12 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
 
 register_kernel_builder(op="RMSNormFwdOp", target="torch_cpu", build_kernel=build_rms_norm)
+register_kernel_builder(op="GemmFwdOp", target="torch_cpu", build_kernel=build_gemm)
 ```
 
-`pip install` 之后自动生效:TileOPs 在构造第一个 Op 时枚举这个 entry point 组,import 声明的模块,顶层的两次调用把注册表填好。没有其他初始化步骤,没有需要继承的基类,也没有需要实现的接口。
+`op=` 用的是 manifest 里的键,写错就永远不会被调到,而且不报错。
+
+`pip install` 之后自动生效:TileOPs 在构造第一个 Op 时枚举这个 entry point 组、import 声明的模块,顶层这几次调用把注册表填好。没有其他初始化步骤,没有需要继承的基类,也没有需要实现的接口。
 
 ## <a id="s2"></a>2. target 名与设备类型的区别
 
@@ -87,11 +91,11 @@ register_kernel_builder(op="RMSNormFwdOp", target="torch_cpu", build_kernel=buil
 | --- | --- |
 | `pyproject.toml` | entry point 声明,即全部安装机制 |
 | `src/tileops_cpu/__init__.py` | 全部注册代码 |
-| `src/tileops_cpu/kernels.py` | kernel 实现。真实后端在此编译 |
-| `src/tileops_cpu/pending.py` | 一个已注册但当前无法被调用的 builder,见第 7 节 |
+| `src/tileops_cpu/kernels.py` | RMS norm 的 kernel 实现。真实后端在此编译 |
+| `src/tileops_cpu/gemm.py` | 第二个 builder:CPU GEMM,注册给 `GemmFwdOp` |
 | `tests/test_takeover.py` | 数值、校验、归一、输出 |
 | `tests/test_discovery.py` | entry point 与注册 |
-| `tests/test_errors.py` | 四条错误路径 |
+| `tests/test_errors.py` | 三条错误路径 |
 | `tests/test_memoization.py` | 何时重新调用 `build_kernel` |
 
 ## <a id="s4"></a>4. `build_kernel` 的签名与参数
@@ -141,35 +145,34 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
 ## <a id="s6"></a>6. 何时重新调用 `build_kernel`
 
-TileOPs 按**输入签名**记住 `build_kernel` 的返回值:
+TileOPs 按**设备加输入签名**记住 `build_kernel` 的返回值:
 
-> 按 `signature.inputs` 的顺序,逐个取 `(dtype, shape)`。
+> 本次调用张量所在的设备,加上按 `signature.inputs` 顺序逐个取出的 `(dtype, shape)`。
 
-也就是说:**输入签名相同的两次调用,TileOPs 会交给后端同一个 kernel。**
-
-`device` 不进入 key —— 产物是否随设备而不同属于后端内部的事;返回的可调用体每次都能拿到真实张量,需要时在那时分派。`params` 也不进入 key,它们对一个 op 实例是固定的。
+也就是说:**设备与输入签名都相同的两次调用,TileOPs 会交给后端同一个 kernel。** 设备进 key,是因为为一块卡编译出的产物可能持有那块卡上的资源;同一个 target 的第二块卡会重新问一次 builder。`params` 不进入 key,它们对一个 op 实例是固定的。
 
 需要更细的区分,在后端内部处理;需要更粗的粒度以减少重建,在 `build_kernel` 内部另加缓存。两个方向都在后端一侧解决。
 
 `tests/test_memoization.py` 逐项验证了这条规则,包括 key 的实际形态:
 
 ```python
-assert key == ((torch.float16, (4, 64)), (torch.float16, (64,)))  # x 在前,weight 在后
+device, *inputs = key
+assert device.type == "cpu"
+assert inputs == [(torch.float16, (4, 64)), (torch.float16, (64,))]  # x 在前,weight 在后
 ```
 
-## <a id="s7"></a>7. 安装后 op 的三种状态
+## <a id="s7"></a>7. 安装后 op 的两种状态
 
 一旦 `detect` 认领了某类设备,该设备上的**所有** op 都由这个 target 服务;缺少任何一个都会报错,**不会落回仓内实现**。原因很直接:选中一个 target 意味着该设备属于另一套硬件,TileOPs 自带的 kernel 在其上无法启动,落回只会把一个清楚的「该 target 未实现此 op」换成一个难以理解的启动失败。
 
-因此每个 op 处于三种状态之一:
+因此每个 op 只有两种状态:
 
-| 状态 | 例子 | 结果 |
-| --- | --- | --- |
-| 已注册 builder,且该 op 已接上外部路径 | `RMSNormFwdOp` | 正常执行 |
-| 已注册 builder,但该 op 尚未接上外部路径 | `GemmOp` | 报错,**需要修改的是 TileOPs** |
-| 未注册 builder | 其余全部 | 报错 |
+| 状态 | 结果 |
+| --- | --- |
+| 这个 target 为该 op 注册了 builder | 正常执行 |
+| 没有注册 | 报错,指出该 target 未为这个 op 注册 builder |
 
-第二种状态源于 TileOPs 当前的迁移进度:op 的取 kernel 处必须交出要传给该 kernel 的张量,TileOPs 才能计算外部路径的记忆 key。
+覆盖目标模型用到的每一个 op,因此是后端一侧的工作。op 那一侧的前提已由设计保证:取 kernel 时把即将传给 kernel 的张量一并交出,外部路径才算得出记忆 key。
 
 ```python
 # TileOPs 内部,op 自身的 forward
@@ -177,39 +180,36 @@ self.get_or_build_kernel("gemm_kernel", (a, b), key=..., build=...)
 #                                       ^^^^^^ 这一项
 ```
 
-**目前只有 `RMSNormFwdOp` 交出了它**,其余 84 个取 kernel 处尚未交出。这是机械改动,会逐个 op 补齐。
+**注册名必须与 manifest 的键逐字符相同。** 本仓库注册的是 `RMSNormFwdOp` 与 `GemmFwdOp`;写成 `GemmOp` 这类不存在的键,builder 永远不会被调用,而且没有任何报错 —— op 层查 `(op, target)` 查不到,就当这个 target 没有为该 op 注册。
 
-`src/tileops_cpu/pending.py` 中的 `build_gemm` 正是这种情况:实现正确,注册成功,但目前调用不到。在 TileOPs 补上这一项之前先写好 builder 是正常的工作顺序 —— `GemmOp` 接上的当天,这个后端无需改动即可服务它。
+### <a id="s7-1"></a>7.1 target 定下来之前的硬件查询
 
-### <a id="s7-1"></a>7.1 接缝之前的平台判据
+按设计,op 层在 target 定下来之前不查询与特定硬件绑定的信息;查了就意味着在没有该驱动的机器上,调用会在到达 `build_kernel` 之前失败,而原因与这个后端无关。
 
-即使一个 op 已接上外部路径,TileOPs 的 `forward` 中仍可能残留与特定硬件绑定的代码。`GemmOp` 就是这样:
+GEMM 目前还有一处:`GemmFwdOp` 构造 `GemmCall` 时未指明 `arch`,于是 `CallSpec.__post_init__` 去读 SM 版本:
 
 ```
-tileops/ops/gemm.py:102       _get_kernel
 tileops/kernels/call_spec.py  CallSpec.__post_init__
-tileops/utils/utils.py:39     get_sm_version  ->  torch.cuda.current_device()
+tileops/utils/utils.py        get_sm_version  ->  torch.cuda.current_device()
 ```
 
-选中的 target 是 CPU 的,这段代码仍会去查询 CUDA 的 SM 版本。在没有 CUDA 驱动的机器上,调用在到达 `build_kernel` 之前就失败了。
+所以在无 CUDA 驱动的机器上,由这个 CPU 后端服务的 GEMM 也跑不起来。撞到这类失败时,调用栈会停在 TileOPs 内部而不是后端的 `build_kernel` 里 —— 提 issue 并附上调用栈,需要修改的是 TileOPs。
 
-TileOPs 中现存约 94 处此类判据,清除它们是接入第一个真实异构后端的前提,将按 family 分批进行。在此之前,后端作者会在自己的硬件上遇到这些判据。遇到时应向 TileOPs 提 issue 并附上调用栈,需要修改的是 TileOPs。
-
-本仓库因此为两个测试加了 `requires_cuda_runtime` 标记,在无 GPU 的机器上自动跳过。它们检验的是 TileOPs 的平台假设,而非这个后端。
+本仓库因此为两个测试加了 `requires_cuda_runtime` 标记,在无 GPU 的机器上自动跳过:一个是上面这条路径,另一个是 `target=BUILTIN`(它要的就是仓内的 CUDA kernel)。
 
 ## <a id="s8"></a>8. 错误信息对照
 
 以下均为实测输出。
 
-**已注册 builder,但该 op 尚未接上外部路径:**
+**某个 op 的取 kernel 处没有交出张量:**
 
 ```
-OpNotAvailableError: target 'torch_cpu' serves GemmOp, but its 'gemm_kernel' call site
+OpNotAvailableError: target 'torch_cpu' serves GemmFwdOp, but its 'gemm_kernel' call site
 does not hand over the tensors a builder is described with; that op is not wired to
 external targets yet
 ```
 
-这是 TileOPs 一侧的缺口,不是后端的问题。等待它补上 `inputs=`,或提 issue 请求优先处理该 op。
+TileOPs 的 op 都按契约交出张量,所以正常情况下见不到这条。真见到了,说明 op 那一侧出现了回退,不是后端的问题:提 issue 并附上 op 名。
 
 **未为该 op 注册 builder:**
 
@@ -268,7 +268,7 @@ target 的选取顺序:构造参数 `target=` → 进程默认 → 设备探测�
 
 ```bash
 pip install -e .          # tileops 已安装时加 --no-deps
-python -m pytest -q       # 有 GPU:22 passed;无 GPU:20 passed, 2 skipped
+python -m pytest -q       # 无 GPU 时会跳过两条需要 CUDA 驱动在场的用例,见 7.1
 ```
 
 在 TileOPs 的 dev 镜像中运行,同样不需要修改 TileOPs:
@@ -319,7 +319,7 @@ kernel 调用还须满足两条与流相关的规则:
 
 1. 复制本仓库,把 `tileops_cpu` 改为 `tileops_<硬件名>`,target 名同理
 2. 修改 `_detect`,认领对应的设备类型
-3. 把 `kernels.py` 替换为真实 kernel —— 构造时编译,`__call__` 时启动
-4. 选定第一个要接管的 op,照它的 manifest 签名编写 `build_kernel`
+3. 把 `kernels.py` 与 `gemm.py` 里的 kernel 替换为真实实现 —— 构造时编译,`__call__` 时启动
+4. 选定第一个要接管的 op,照它的 manifest 签名编写 `build_kernel`,注册时用 manifest 的键
 5. `tests/` 中的四个文件基本可以直接沿用,替换 op 名与 target 名即可
 6. 之后逐个 op 增加 `build_kernel`。**目标模型用到的 op 需要全部覆盖**,缺少任何一个都会报错
