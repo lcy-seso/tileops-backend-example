@@ -12,9 +12,9 @@ from tileops.ops.gemm.gemm import GemmFwdOp
 from tileops.ops.norm.rms_norm import RMSNormFwdOp
 
 from conftest import requires_cuda_runtime
-from tileops_cpu import TARGET
-from tileops_cpu.gemm import CpuGemm
-from tileops_cpu.kernels import CpuRMSNorm
+from tileops_cpu.ops.gemm import CpuGemm
+from tileops_cpu.ops.rms_norm import CpuRMSNorm
+from tileops_cpu.target import TARGET
 
 DTYPES = [torch.float16, torch.bfloat16]
 N = 256

@@ -1,13 +1,13 @@
-"""The second builder this backend registers: a CPU GEMM.
+"""GEMM: the kernel, and the builder that constructs it.
 
 One builder per ``(op, target)``. Which of the op's kernels a call wants — ``GemmFwdOp``
 splits into ``gemm_kernel`` and ``gemv_kernel`` — is not passed to a backend, so a builder
 that cares reads the shapes off its :class:`~tileops.backend.TensorSpec` arguments and
 decides for itself. This one does not care: ``torch.matmul`` covers both.
 
-The op has to be registered under the name the manifest gives it — ``GemmFwdOp``. A
-builder registered under any other spelling is never called, and nothing reports it: the op
-layer looks up ``(op, target)`` and finds nothing registered for the op it is serving.
+Registration happens in ``ops/__init__.py``, under the name the manifest gives the op —
+``GemmFwdOp``. A builder registered under any other spelling is never called, and nothing
+reports it: the op layer looks up ``(op, target)`` and finds nothing for the op it serves.
 """
 
 import torch
