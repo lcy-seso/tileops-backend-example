@@ -1,8 +1,8 @@
 """How often the builder is called, and what decides it.
 
 The contract, which TileOPs fixes and a backend cannot change: the external path remembers
-a kernel under the *input signature* — ``(dtype, shape)`` per input, in
-``signature.inputs`` order. Two calls with the same signature get the same kernel object.
+a kernel under the device plus the *input signature* — ``(dtype, shape)`` per input, in
+``signature.inputs`` order. Two calls agreeing on both get the same kernel object.
 """
 
 import torch
@@ -26,12 +26,14 @@ def test_the_same_input_signature_reuses_the_same_kernel():
     assert len(built) == 1, "one build for one signature"
 
 
-def test_the_key_is_dtype_and_shape_per_input_in_manifest_order():
+def test_the_key_is_the_device_then_dtype_and_shape_per_input():
     op = RMSNormFwdOp(normalized_shape=(N,))
     _run(op, 4)
 
     (key,) = op.built_kernels("rms_norm")
-    assert key == ((torch.float16, (4, N)), (torch.float16, (N,))), "x then weight"
+    device, *inputs = key
+    assert device.type == "cpu", "the device a kernel was built for is part of the key"
+    assert inputs == [(torch.float16, (4, N)), (torch.float16, (N,))], "x then weight"
 
 
 def test_a_new_shape_asks_the_builder_again():

@@ -1,24 +1,13 @@
-"""A builder that is correct, registered, and cannot be reached yet.
+"""The second builder this backend registers: a CPU GEMM.
 
-Registering a builder is not by itself enough for a target to serve an op. The op's own
-get-kernel call site has to hand over the tensors the builder is described with::
+One builder per ``(op, target)``. Which of the op's kernels a call wants — ``GemmFwdOp``
+splits into ``gemm_kernel`` and ``gemv_kernel`` — is not passed to a backend, so a builder
+that cares reads the shapes off its :class:`~tileops.backend.TensorSpec` arguments and
+decides for itself. This one does not care: ``torch.matmul`` covers both.
 
-    self.get_or_build_kernel("gemm_kernel", (a, b), key=..., build=...)
-                                            ^^^^^^ this
-
-Without it TileOPs cannot compute the memoization key for the external path, so rather than
-quietly running an in-tree kernel that cannot launch on the target's hardware, it raises::
-
-    OpNotAvailableError: target 'torch_cpu' serves GemmOp, but its 'gemm_kernel' call site
-    does not hand over the tensors a builder is described with; that op is not wired to
-    external targets yet
-
-That is a TileOPs-side gap, not a backend bug, and it is mechanical to close. Today
-``RMSNormFwdOp`` is the only op wired; the rest arrive op by op. Keeping this builder here
-means the day GemmOp is wired, this backend serves it with no change on this side.
-
-Writing builders ahead of the wiring is the normal order of work, so this file is part of
-what the example demonstrates.
+The op has to be registered under the name the manifest gives it — ``GemmFwdOp``. A
+builder registered under any other spelling is never called, and nothing reports it: the op
+layer looks up ``(op, target)`` and finds nothing registered for the op it is serving.
 """
 
 import torch

@@ -8,10 +8,12 @@ import pytest
 import torch
 
 from tileops.backend import BUILTIN
+from tileops.ops.gemm.gemm import GemmFwdOp
 from tileops.ops.norm.rms_norm import RMSNormFwdOp
 
 from conftest import requires_cuda_runtime
 from tileops_cpu import TARGET
+from tileops_cpu.gemm import CpuGemm
 from tileops_cpu.kernels import CpuRMSNorm
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -92,6 +94,24 @@ def test_the_output_does_not_alias_an_input():
 
     assert out.data_ptr() != x.data_ptr()
     torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@requires_cuda_runtime
+def test_a_second_op_is_served_by_its_own_builder():
+    """Two registrations, two builders: the op decides which one it asks for.
+
+    Marked for a CUDA driver because ``GemmFwdOp`` reads the SM version on the way to the
+    get-kernel call site, not because anything here runs on a GPU.
+    """
+    a = torch.randn(64, 32, dtype=torch.float16)
+    b = torch.randn(48, 32, dtype=torch.float16)   # NT by default: b is [N, K]
+
+    op = GemmFwdOp()
+    out = op(a, b)
+
+    assert op._settled_target == TARGET
+    assert isinstance(next(iter(op.built_kernels("gemm_kernel").values())), CpuGemm)
+    torch.testing.assert_close(out, (a.float() @ b.float().t()).half(), rtol=1e-2, atol=1e-2)
 
 
 @requires_cuda_runtime
