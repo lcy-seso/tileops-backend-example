@@ -32,6 +32,16 @@ def test_the_target_is_registered_without_anyone_importing_it():
     assert registered_targets("RMSNormFwdOp") == [TARGET]
 
 
+def test_every_op_in_the_table_is_registered():
+    """``ops.BUILDERS`` is the list this backend claims; registration follows it."""
+    from tileops_cpu.ops import BUILDERS
+
+    _construct_an_op()
+
+    for op in BUILDERS:
+        assert registered_targets(op) == [TARGET], op
+
+
 def test_this_backend_loaded_cleanly():
     _construct_an_op()
 

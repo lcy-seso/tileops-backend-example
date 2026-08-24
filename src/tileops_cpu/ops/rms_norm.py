@@ -1,6 +1,7 @@
-"""The kernels themselves. A real backend compiles here; this one calls PyTorch.
+"""RMS norm: the kernel, and the builder that constructs it.
 
-Two rules shape every class in this file:
+A real backend compiles in the kernel's constructor; this one calls PyTorch. Two rules
+shape every kernel class:
 
 * **The constructor takes compile-time parameters only** — values that would be baked into
   generated code. Anything that varies per call stays in ``__call__``. Put a leading
@@ -14,7 +15,9 @@ import math
 
 import torch
 
-__all__ = ["CpuRMSNorm"]
+from tileops.backend import TensorSpec
+
+__all__ = ["CpuRMSNorm", "build_rms_norm"]
 
 
 class CpuRMSNorm:
@@ -66,3 +69,27 @@ class CpuRMSNorm:
     def __repr__(self) -> str:
         return (f"CpuRMSNorm(normalized_shape={self.normalized_shape}, "
                 f"eps={self.eps}, dtype={self.dtype})")
+
+
+def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
+    """Build the kernel that serves one RMS norm call shape.
+
+    The signature is the op's manifest signature and nothing else: ``signature.inputs`` in
+    declaration order as positional :class:`~tileops.backend.TensorSpec`, then
+    ``signature.params`` by keyword. ``eps`` defaults to null in the manifest, and arrives
+    here as the number the op settled on.
+
+    A ``TensorSpec`` carries device, dtype and shape — no data, and no reference to the
+    tensor. So a builder cannot key on values it would then be memoized against, and cannot
+    keep a tensor alive for the process lifetime by holding the kernel.
+
+    Args:
+        x: The tensor to normalize.
+        weight: The affine scale.
+        normalized_shape: Trailing axes the reduction runs over.
+        eps: Denominator epsilon, already resolved to a float.
+
+    Returns:
+        Something callable with the two tensors described above.
+    """
+    return CpuRMSNorm(normalized_shape, eps, x.dtype)

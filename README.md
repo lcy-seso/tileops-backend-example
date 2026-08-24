@@ -50,25 +50,33 @@ $ python -c "...同一段代码..."
 torch_cpu = "tileops_cpu"
 ```
 
-第二处是模块顶层的注册:一次 `register_detector`,再为每个要接管的 op 各一次 `register_kernel_builder`。
+第二处是模块顶层的注册:一次 `register_detector`,再为每个要接管的 op 各一次 `register_kernel_builder`。本仓库把这些内容分在四个文件里:
 
 ```python
-from tileops.backend import TensorSpec, register_detector, register_kernel_builder
-from .gemm import build_gemm
-from .kernels import CpuRMSNorm
+# src/tileops_cpu/target.py —— 这套 kernel 的名字,以及它认领哪类设备
+TARGET = "torch_cpu"
 
-register_detector(target="torch_cpu", detect=lambda device: device.type == "cpu")
+def detect(device: torch.device) -> bool:
+    return device.type == "cpu"
 
 
+# src/tileops_cpu/ops/rms_norm.py —— 一个 op 的 kernel 与它的 builder 放在一起
 def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
     return CpuRMSNorm(normalized_shape, eps, x.dtype)
 
 
-register_kernel_builder(op="RMSNormFwdOp", target="torch_cpu", build_kernel=build_rms_norm)
-register_kernel_builder(op="GemmFwdOp", target="torch_cpu", build_kernel=build_gemm)
+# src/tileops_cpu/ops/__init__.py —— 这个后端声称能服务哪些 op
+BUILDERS = {"RMSNormFwdOp": build_rms_norm, "GemmFwdOp": build_gemm}
+
+
+# src/tileops_cpu/__init__.py —— 只做注册
+register_detector(target=TARGET, detect=detect)
+
+for op, build_kernel in BUILDERS.items():
+    register_kernel_builder(op=op, target=TARGET, build_kernel=build_kernel)
 ```
 
-`op=` 用的是 manifest 里的键,写错就永远不会被调到,而且不报错。
+`BUILDERS` 的键是 manifest 里的键,写错就永远不会被调到,而且不报错。增加一个 op 就是加一个 `ops/<名字>.py`,再在这张表里加一行。
 
 `pip install` 之后自动生效:TileOPs 在构造第一个 Op 时枚举这个 entry point 组、import 声明的模块,顶层这几次调用把注册表填好。没有其他初始化步骤,没有需要继承的基类,也没有需要实现的接口。
 
@@ -90,13 +98,17 @@ register_kernel_builder(op="GemmFwdOp", target="torch_cpu", build_kernel=build_g
 | 文件 | 内容 |
 | --- | --- |
 | `pyproject.toml` | entry point 声明,即全部安装机制 |
-| `src/tileops_cpu/__init__.py` | 全部注册代码 |
-| `src/tileops_cpu/kernels.py` | RMS norm 的 kernel 实现。真实后端在此编译 |
-| `src/tileops_cpu/gemm.py` | 第二个 builder:CPU GEMM,注册给 `GemmFwdOp` |
+| `src/tileops_cpu/__init__.py` | 只做注册:一次 detect,加表里每个 op 一次 builder |
+| `src/tileops_cpu/target.py` | target 名与 `detect` |
+| `src/tileops_cpu/ops/__init__.py` | `BUILDERS`:manifest 键 → builder,这个后端服务哪些 op |
+| `src/tileops_cpu/ops/rms_norm.py` | RMS norm 的 kernel 与 builder。真实后端在此编译 |
+| `src/tileops_cpu/ops/gemm.py` | GEMM 的 kernel 与 builder |
 | `tests/test_takeover.py` | 数值、校验、归一、输出 |
 | `tests/test_discovery.py` | entry point 与注册 |
 | `tests/test_errors.py` | 三条错误路径 |
 | `tests/test_memoization.py` | 何时重新调用 `build_kernel` |
+
+一个 op 的 kernel 与它的 builder 放在同一个模块里:两者一起改动,而 builder 的签名就是这个 op 的 manifest 签名。
 
 ## <a id="s4"></a>4. `build_kernel` 的签名与参数
 
@@ -127,7 +139,7 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
 对返回值只有一条要求:**可调用**。调用时按同样顺序收到真实张量,返回值按 `signature.outputs` —— 单输出返回张量,多输出按顺序返回 tuple,纯原地写返回 `None`。
 
-**构造签名只接收编译期参数。** 会被编译进生成代码的值(tile 尺寸、当作常量的维度、dtype)放进构造函数,其余留给 `__call__`。这一条对 decode 是硬性要求:`seq_len` 逐步递增,batch 随 running set 变化,它们进入构造函数就意味着每步重新编译。`kernels.py` 中的 `CpuRMSNorm` 在构造时**拿不到行数**,原因即在于此。
+**构造签名只接收编译期参数。** 会被编译进生成代码的值(tile 尺寸、当作常量的维度、dtype)放进构造函数,其余留给 `__call__`。这一条对 decode 是硬性要求:`seq_len` 逐步递增,batch 随 running set 变化,它们进入构造函数就意味着每步重新编译。`ops/rms_norm.py` 中的 `CpuRMSNorm` 在构造时**拿不到行数**,原因即在于此。
 
 ## <a id="s5"></a>5. op 层已经完成的工作
 
@@ -317,9 +329,9 @@ kernel 调用还须满足两条与流相关的规则:
 
 ## <a id="s13"></a>13. 作为模板使用
 
-1. 复制本仓库,把 `tileops_cpu` 改为 `tileops_<硬件名>`,target 名同理
-2. 修改 `_detect`,认领对应的设备类型
-3. 把 `kernels.py` 与 `gemm.py` 里的 kernel 替换为真实实现 —— 构造时编译,`__call__` 时启动
-4. 选定第一个要接管的 op,照它的 manifest 签名编写 `build_kernel`,注册时用 manifest 的键
+1. 复制本仓库,把 `tileops_cpu` 改为 `tileops_<硬件名>`,`target.py` 里的 target 名同理
+2. 修改 `target.py` 的 `detect`,认领对应的设备类型
+3. 选定第一个要接管的 op,新建 `ops/<名字>.py`:kernel 构造时编译、`__call__` 时启动,builder 照该 op 的 manifest 签名写
+4. 在 `ops/__init__.py` 的 `BUILDERS` 里加一行,键用 manifest 的键
 5. `tests/` 中的四个文件基本可以直接沿用,替换 op 名与 target 名即可
-6. 之后逐个 op 增加 `build_kernel`。**目标模型用到的 op 需要全部覆盖**,缺少任何一个都会报错
+6. 之后逐个 op 重复第 3、4 步。**目标模型用到的 op 需要全部覆盖**,缺少任何一个都会报错
