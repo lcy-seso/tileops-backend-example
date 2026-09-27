@@ -35,7 +35,7 @@ def test_a_failed_call_settles_no_target():
 
     with pytest.raises(ValueError):
         op(torch.randn(4, 9, dtype=F16), torch.randn(8, dtype=F16))
-    assert op._settled_target is None
+    assert op.settled_target is None
 
     op(torch.randn(4, 8, dtype=F16), torch.randn(8, dtype=F16))
-    assert op._settled_target == "torch_cpu"
+    assert op.settled_target == "torch_cpu"

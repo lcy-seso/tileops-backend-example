@@ -8,7 +8,7 @@
 $ python -c "import torch; from tileops.ops.norm.rms_norm import RMSNormFwdOp; \
              RMSNormFwdOp(normalized_shape=(64,))(torch.randn(4,64,dtype=torch.float16), \
                                                   torch.randn(64,dtype=torch.float16))"
-ValueError: RMSNormKernel is a CUDA kernel; got x on cpu and weight on cpu.
+OpNotAvailableError: RMSNormFwdOp's in-tree kernels do not run on cpu; known targets for this op: []
 
 $ pip install -e .
 
@@ -26,7 +26,7 @@ $ python -c "...同一段代码..."
 <li><a href="#s4">4. build_kernel 的签名与参数</a></li>
 <li><a href="#s5">5. op 层已经完成的工作</a></li>
 <li><a href="#s6">6. 何时重新调用 build_kernel</a></li>
-<li><a href="#s7">7. 安装后 op 的两种状态</a>
+<li><a href="#s7">7. 安装后 op 的三种状态</a>
   <ul>
     <li><a href="#s7-1">7.1 target 定下来之前的硬件查询</a></li>
   </ul>
@@ -61,7 +61,9 @@ def detect(device: torch.device) -> bool:
 
 
 # src/tileops_cpu/ops/rms_norm.py —— 一个 op 的 kernel 与它的 builder 放在一起
-def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
+def build_rms_norm(x: TensorSpec, weight: TensorSpec | None, *, normalized_shape, eps):
+    if eps is None:                        # manifest 默认值,含义同 ref_api
+        eps = torch.finfo(torch.float32).eps
     return CpuRMSNorm(normalized_shape, eps, x.dtype)
 
 
@@ -114,40 +116,42 @@ for op, build_kernel in BUILDERS.items():
 
 **签名就是该 op 的 manifest 签名。** 编写 kernel 只需阅读 manifest,不需要阅读 TileOPs 源码。
 
-`src/tileops/manifest/normalization.yaml` 中的 `RMSNormFwdOp`:
+`src/tileops/manifest/spec/norm.yaml` 中的 `RMSNormFwdOp`:
 
 ```yaml
 signature:
-  inputs:                       # 声明顺序即传入顺序
-    x: {dtype: "float16 | bfloat16"}
-    weight: {dtype: "same_as(x)"}
+  forall: {B: Shape, T: "DType[float16 | bfloat16]"}
   params:                       # 按这些名字作为关键字参数传入
     normalized_shape: {type: "list[int] | tuple[int, ...]"}
     eps: {type: "float | None", default: null}
+  inputs:                       # 声明顺序即传入顺序
+    x: {dtype: T, shape: "[*B, *normalized_shape]"}
+    weight: {dtype: T, shape: "[*normalized_shape]", optional: true}
 ```
 
 对应的 builder:
 
 ```python
-def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
+def build_rms_norm(x: TensorSpec, weight: TensorSpec | None, *, normalized_shape, eps):
 ```
 
-两点需要注意:
+三点需要注意:
 
-- **`eps` 收到的是 `1e-6`,不是 `None`。** manifest 中的默认值是 null,但 op 层已将其规范化为确定的数值。所有可选参数都是如此。
+- **参数按 op 实例持有的值传入。** 构造时没给 `eps`,builder 收到的就是 manifest 默认值 `None`,含义与 ref_api `torch.nn.functional.rms_norm` 相同:float32 累加的机器精度。由 builder 按这个含义处理。
+- **可选输入保留自己的位置。** 调用没传 `weight` 时,builder 在这个位置收到 `None`,kernel 调用时同样收到 `None`。
 - **`TensorSpec` 是描述而非张量**,只有 `device` / `dtype` / `shape`,既没有数据,也没有对张量的引用。这样两类错误就无法写出来:一是根据数据内容决定构造哪个 kernel(而记忆表按形状索引,后续会取到错误的 kernel),二是让某个张量随被缓存的 kernel 存活整个进程。
 
-对返回值只有一条要求:**可调用**。调用时按同样顺序收到真实张量,返回值按 `signature.outputs` —— 单输出返回张量,多输出按顺序返回 tuple,纯原地写返回 `None`。
+对返回值只有一条要求:**可调用**。调用时按同样顺序收到真实张量(`forward` 若接收 `out` 这类输出缓冲区,则按关键字另外传入),返回值按 `signature.outputs` —— 单输出返回张量,多输出按顺序返回 tuple,纯原地写返回 `None`。
 
 **构造签名只接收编译期参数。** 会被编译进生成代码的值(tile 尺寸、当作常量的维度、dtype)放进构造函数,其余留给 `__call__`。这一条对 decode 是硬性要求:`seq_len` 逐步递增,batch 随 running set 变化,它们进入构造函数就意味着每步重新编译。`ops/rms_norm.py` 中的 `CpuRMSNorm` 在构造时**拿不到行数**,原因即在于此。
 
 ## <a id="s5"></a>5. op 层已经完成的工作
 
-以下工作对所有 target 相同,后端**不要重复实现**:
+target 服务的是整个 op:op 层先跑由 manifest 签名生成的检查,再把整次调用交给 target 的 kernel,op 自己的仓内路径不再执行。以下工作对所有 target 相同,后端**不要重复实现**:
 
 - manifest 的 dtype 校验与形状规则
-- 参数规范化(可选值落实为确定值)
-- 输入的连续性归一 —— 传入 kernel 的都是连续张量
+- 设备归一 —— 一次调用的张量都在同一设备上
+- 输入的连续性归一 —— 调用不写入的输入都是连续张量
 - kernel 的记忆与重用
 - roofline、profile、数值测试
 
@@ -159,7 +163,7 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
 TileOPs 按**设备加输入签名**记住 `build_kernel` 的返回值:
 
-> 本次调用张量所在的设备,加上按 `signature.inputs` 顺序逐个取出的 `(dtype, shape)`。
+> 本次调用张量所在的设备,加上按 `signature.inputs` 顺序逐个取出的 `(dtype, shape)`;本次没传的可选输入记为 `None`。
 
 也就是说:**设备与输入签名都相同的两次调用,TileOPs 会交给后端同一个 kernel。** 设备进 key,是因为为一块卡编译出的产物可能持有那块卡上的资源;同一个 target 的第二块卡会重新问一次 builder。`params` 不进入 key,它们对一个 op 实例是固定的。
 
@@ -171,57 +175,34 @@ TileOPs 按**设备加输入签名**记住 `build_kernel` 的返回值:
 device, *inputs = key
 assert device.type == "cpu"
 assert inputs == [(torch.float16, (4, 64)), (torch.float16, (64,))]  # x 在前,weight 在后
+# 不传 weight 时,key 为 (device, (torch.float16, (4, 64)), None)
 ```
 
-## <a id="s7"></a>7. 安装后 op 的两种状态
+## <a id="s7"></a>7. 安装后 op 的三种状态
 
-一旦 `detect` 认领了某类设备,该设备上的**所有** op 都由这个 target 服务;缺少任何一个都会报错,**不会落回仓内实现**。原因很直接:选中一个 target 意味着该设备属于另一套硬件,TileOPs 自带的 kernel 在其上无法启动,落回只会把一个清楚的「该 target 未实现此 op」换成一个难以理解的启动失败。
+一旦 `detect` 认领了某类设备,该设备上每个自己构造 kernel 的 op 都由这个 target 服务;缺少任何一个都会报错,**不会落回仓内实现**。原因很直接:选中一个 target 意味着该设备属于另一套硬件,TileOPs 自带的 kernel 在其上无法启动,落回只会把一个清楚的「该 target 未实现此 op」换成一个难以理解的启动失败。组合 op 只运行 sub-op,不需要 builder。
 
-因此每个 op 只有两种状态:
+因此每个 op 处于三种状态之一:
 
 | 状态 | 结果 |
 | --- | --- |
-| 这个 target 为该 op 注册了 builder | 正常执行 |
-| 没有注册 | 报错,指出该 target 未为这个 op 注册 builder |
+| 这个 target 为该 op 注册了 builder | 整个 op 在这个 target 上执行 |
+| 没有注册,且该 op 自己构造 kernel | 报错,指出该 target 未为这个 op 注册 builder |
+| 没有注册,且该 op 是组合 op | 运行它的组合,每个 sub-op 各自选定 target |
 
-覆盖目标模型用到的每一个 op,因此是后端一侧的工作。op 那一侧的前提已由设计保证:取 kernel 时把即将传给 kernel 的张量一并交出,外部路径才算得出记忆 key。
-
-```python
-# TileOPs 内部,op 自身的 forward
-self.get_or_build_kernel("gemm_kernel", (a, b), key=..., build=...)
-#                                       ^^^^^^ 这一项
-```
+覆盖目标模型用到的每一个 op,因此是后端一侧的工作。op 那一侧由设计保证:外部路径的记忆 key 取自调用本身的输入,不依赖 op 内部取 kernel 的位置。
 
 **注册名必须与 manifest 的键逐字符相同。** 本仓库注册的是 `RMSNormFwdOp` 与 `GemmFwdOp`;写成 `GemmOp` 这类不存在的键,builder 永远不会被调用,而且没有任何报错 —— op 层查 `(op, target)` 查不到,就当这个 target 没有为该 op 注册。
 
 ### <a id="s7-1"></a>7.1 target 定下来之前的硬件查询
 
-按设计,op 层在 target 定下来之前不查询与特定硬件绑定的信息;查了就意味着在没有该驱动的机器上,调用会在到达 `build_kernel` 之前失败,而原因与这个后端无关。
+按设计,op 层在 target 定下来之前不查询与特定硬件绑定的信息(例如 CUDA SM 版本);查了就意味着在没有该驱动的机器上,调用会在到达 `build_kernel` 之前失败,而原因与这个后端无关。本仓库的全部测试在无 GPU 的机器上运行,没有跳过项,即是对这一条的检查。
 
-GEMM 目前还有一处:`GemmFwdOp` 构造 `GemmCall` 时未指明 `arch`,于是 `CallSpec.__post_init__` 去读 SM 版本:
-
-```
-tileops/kernels/call_spec.py  CallSpec.__post_init__
-tileops/utils/utils.py        get_sm_version  ->  torch.cuda.current_device()
-```
-
-所以在无 CUDA 驱动的机器上,由这个 CPU 后端服务的 GEMM 也跑不起来。撞到这类失败时,调用栈会停在 TileOPs 内部而不是后端的 `build_kernel` 里 —— 提 issue 并附上调用栈,需要修改的是 TileOPs。
-
-本仓库因此为两个测试加了 `requires_cuda_runtime` 标记,在无 GPU 的机器上自动跳过:一个是上面这条路径,另一个是 `target=BUILTIN`(它要的就是仓内的 CUDA kernel)。
+撞到这类失败时,调用栈会停在 TileOPs 内部而不是后端的 `build_kernel` 里 —— 提 issue 并附上调用栈,需要修改的是 TileOPs。
 
 ## <a id="s8"></a>8. 错误信息对照
 
 以下均为实测输出。
-
-**某个 op 的取 kernel 处没有交出张量:**
-
-```
-OpNotAvailableError: target 'torch_cpu' serves GemmFwdOp, but its 'gemm_kernel' call site
-does not hand over the tensors a builder is described with; that op is not wired to
-external targets yet
-```
-
-TileOPs 的 op 都按契约交出张量,所以正常情况下见不到这条。真见到了,说明 op 那一侧出现了回退,不是后端的问题:提 issue 并附上 op 名。
 
 **未为该 op 注册 builder:**
 
@@ -244,8 +225,7 @@ UnknownTargetError: no backend registered target 'nope'; known targets: ['torch_
 **用 `target=BUILTIN` 强制使用仓内实现:**
 
 ```
-ValueError: RMSNormKernel is a CUDA kernel; got x on cpu and weight on cpu.
-Another target's backend serves other devices.
+OpNotAvailableError: RMSNormFwdOp's in-tree kernels do not run on cpu; known targets for this op: ['torch_cpu']
 ```
 
 `BUILTIN` 显式绕过后端。CPU 张量上仓内实现无法运行,这正好说明了「不落回」这条规则要避免的是什么。
@@ -272,7 +252,7 @@ set_default_target("torch_cpu")      # 进程默认,优先于设备探测
 set_default_target(BUILTIN)          # 全局关闭替换
 ```
 
-target 的选取顺序:构造参数 `target=` → 进程默认 → 设备探测。不存在「默认 target」这一概念,默认状态是不替换。
+target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 设备探测。选定的 target 可从 `op.settled_target` 读出。不存在「默认 target」这一概念,默认状态是不替换。
 
 ## <a id="s10"></a>10. 运行测试
 
@@ -280,7 +260,7 @@ target 的选取顺序:构造参数 `target=` → 进程默认 → 设备探测�
 
 ```bash
 pip install -e .          # tileops 已安装时加 --no-deps
-python -m pytest -q       # 无 GPU 时会跳过两条需要 CUDA 驱动在场的用例,见 7.1
+python -m pytest -q       # 有无 GPU 都是 24 passed,见 7.1
 ```
 
 在 TileOPs 的 dev 镜像中运行,同样不需要修改 TileOPs:
@@ -322,7 +302,7 @@ kernel 调用还须满足两条与流相关的规则:
 | 同一个 target 上有多个后端 | 一个 target 对应一套 kernel、一个提供者。重复注册同一个 `(op, target)` 直接报错,那意味着安装了两个都自称是它的包 |
 | 整体替换一个组合 op | 组合 op 的计算在它构造的 sub-op 中,替换发生在那一层 |
 | 后端改变输入形状,或代替调用方还原输出 | 那是 op 层对所有 target 提供的服务;要改就对所有 target 一起改 |
-| 一次调用跨多个设备 | CPU 标量走 params 而非张量输入,所有输入必须在同一设备 |
+| 一次调用跨多个设备 | 所有输入必须在同一设备,manifest 声明为 `device: cpu` 的张量除外 |
 | 调用方提供 workspace 或显式 stream | 后端需要的只是当前流,而 torch 的流是隐式当前值 |
 | autograd 联动 | 这条链服务推理。fwd / bwd 各是独立的 op |
 | 换用另一个 target | 指定的 target 没有实现就报错,不会改用别的 target 执行 |

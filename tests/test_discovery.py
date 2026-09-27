@@ -59,4 +59,4 @@ def test_detection_is_what_selects_it():
     op = _construct_an_op()
     op(torch.randn(4, 64, dtype=torch.float16), torch.randn(64, dtype=torch.float16))
 
-    assert op._settled_target == TARGET, "selected from the device, with no target= given"
+    assert op.settled_target == TARGET, "selected from the device, with no target= given"
