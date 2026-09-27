@@ -7,8 +7,9 @@ shape every kernel class:
   generated code. Anything that varies per call stays in ``__call__``. Put a leading
   dimension in a constructor and decode rebuilds a kernel every step.
 * **The op layer has already done its half.** Inputs arrive validated, contiguous, in
-  ``signature.inputs`` order, with parameters resolved to concrete values. Re-checking them
-  here would duplicate a contract that lives in the manifest.
+  ``signature.inputs`` order. Re-checking them here would duplicate a contract that lives in
+  the manifest. Parameters arrive as the op instance holds them, so a manifest default of
+  null arrives as ``None`` and the builder decides what it means.
 """
 
 import math
@@ -28,9 +29,11 @@ class CpuRMSNorm:
 
         y = x * rsqrt(mean(x ** 2, trailing_axes) + eps) * weight
 
+    An absent ``weight`` scales by one.
+
     Args:
         normalized_shape: Trailing-axis shape the reduction runs over.
-        eps: Denominator epsilon, already a number.
+        eps: Denominator epsilon, a number.
         dtype: The input dtype this instance was built for. Storage dtype only — the
             reduction runs in float32 and casts back at the boundary, because the sum of
             squares of a 16-bit row overflows well before the row is long enough to matter.
@@ -51,33 +54,37 @@ class CpuRMSNorm:
         self._axes = tuple(range(-len(self.normalized_shape), 0))
         self._elems = math.prod(self.normalized_shape)
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, weight: "torch.Tensor | None") -> torch.Tensor:
         """Run one call.
 
         Args:
             x: Contiguous, dtype and trailing shape as built for.
-            weight: Contiguous, shape ``normalized_shape``.
+            weight: Contiguous, shape ``normalized_shape``, or ``None`` when the call
+                omitted it.
 
         Returns:
             A new tensor shaped like *x*, dtype ``same_as(x)`` per the manifest. Fresh
             storage: the manifest declares no input as mutated, so nothing may alias.
         """
         acc = x.float()
-        scale = torch.rsqrt(acc.pow(2).mean(dim=self._axes, keepdim=True) + self.eps)
-        return (acc * scale * weight.float()).to(self.dtype)
+        y = acc * torch.rsqrt(acc.pow(2).mean(dim=self._axes, keepdim=True) + self.eps)
+        if weight is not None:
+            y = y * weight.float()
+        return y.to(self.dtype)
 
     def __repr__(self) -> str:
         return (f"CpuRMSNorm(normalized_shape={self.normalized_shape}, "
                 f"eps={self.eps}, dtype={self.dtype})")
 
 
-def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
+def build_rms_norm(x: TensorSpec, weight: "TensorSpec | None", *, normalized_shape, eps):
     """Build the kernel that serves one RMS norm call shape.
 
     The signature is the op's manifest signature and nothing else: ``signature.inputs`` in
     declaration order as positional :class:`~tileops.backend.TensorSpec`, then
-    ``signature.params`` by keyword. ``eps`` defaults to null in the manifest, and arrives
-    here as the number the op settled on.
+    ``signature.params`` by keyword. The manifest declares ``weight`` optional, so a call
+    that omits it arrives here as ``None``. ``eps`` defaults to null in the manifest and
+    arrives as the op instance holds it: ``None`` unless the caller gave a number.
 
     A ``TensorSpec`` carries device, dtype and shape — no data, and no reference to the
     tensor. So a builder cannot key on values it would then be memoized against, and cannot
@@ -85,11 +92,15 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec, *, normalized_shape, eps):
 
     Args:
         x: The tensor to normalize.
-        weight: The affine scale.
+        weight: The affine scale, or ``None``.
         normalized_shape: Trailing axes the reduction runs over.
-        eps: Denominator epsilon, already resolved to a float.
+        eps: Denominator epsilon, or ``None`` for the ``ref_api`` default.
 
     Returns:
         Something callable with the two tensors described above.
     """
+    # ``eps=None`` means what it means in torch.nn.functional.rms_norm: the machine epsilon
+    # of the float32 accumulation.
+    if eps is None:
+        eps = torch.finfo(torch.float32).eps
     return CpuRMSNorm(normalized_shape, eps, x.dtype)

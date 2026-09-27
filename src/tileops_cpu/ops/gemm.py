@@ -1,9 +1,10 @@
 """GEMM: the kernel, and the builder that constructs it.
 
-One builder per ``(op, target)``. Which of the op's kernels a call wants — ``GemmFwdOp``
-splits into ``gemm_kernel`` and ``gemv_kernel`` — is not passed to a backend, so a builder
-that cares reads the shapes off its :class:`~tileops.backend.TensorSpec` arguments and
-decides for itself. This one does not care: ``torch.matmul`` covers both.
+One builder per ``(op, target)``, and the target serves the whole op. Which of its in-tree
+kernels ``GemmFwdOp`` would have picked — it declares three in ``kernel_types`` — is not
+passed to a backend, so a builder that cares reads the shapes off its
+:class:`~tileops.backend.TensorSpec` arguments and decides for itself. This one does not
+care: ``torch.matmul`` covers every case.
 
 Registration happens in ``ops/__init__.py``, under the name the manifest gives the op —
 ``GemmFwdOp``. A builder registered under any other spelling is never called, and nothing

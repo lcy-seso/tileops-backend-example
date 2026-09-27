@@ -10,9 +10,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # The TileOPs dev image carries the pinned torch / CUDA / tilelang stack, so nothing
-    # has to be resolved here. No GPU on this runner: the tests that need a CUDA driver
-    # skip themselves, and they are the ones exercising TileOPs' own platform assumptions
-    # rather than this backend. See tests/conftest.py.
+    # has to be resolved here. No GPU on this runner, and none is needed: every op this
+    # backend serves runs on CPU without TileOPs touching CUDA.
     container: ghcr.io/tile-ai/tileops-runner:cu132-torch2.13-tl-afcebed1-dev
 
     steps:

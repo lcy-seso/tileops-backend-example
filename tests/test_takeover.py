@@ -7,11 +7,10 @@ contiguity normalization and output handling did not move to the backend.
 import pytest
 import torch
 
-from tileops.backend import BUILTIN
+from tileops.backend import BUILTIN, OpNotAvailableError
 from tileops.ops.gemm.gemm import GemmFwdOp
 from tileops.ops.norm.rms_norm import RMSNormFwdOp
 
-from conftest import requires_cuda_runtime
 from tileops_cpu.ops.gemm import CpuGemm
 from tileops_cpu.ops.rms_norm import CpuRMSNorm
 from tileops_cpu.target import TARGET
@@ -20,7 +19,7 @@ DTYPES = [torch.float16, torch.bfloat16]
 N = 256
 
 
-def _ref(x, weight, eps=1e-6):
+def _ref(x, weight, eps=None):
     return torch.nn.functional.rms_norm(x, (N,), weight, eps=eps)
 
 
@@ -40,27 +39,41 @@ def test_the_target_is_what_served_it():
     op = RMSNormFwdOp(normalized_shape=(N,))
     op(torch.randn(4, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16))
 
-    assert op._settled_target == TARGET
+    assert op.settled_target == TARGET
     assert isinstance(next(iter(op.built_kernels("rms_norm").values())), CpuRMSNorm)
 
 
-def test_eps_arrives_as_a_number_not_none():
-    """The manifest defaults ``eps`` to null; the op settles it before the seam."""
-    seen = {}
-    original = CpuRMSNorm.__init__
+def test_eps_arrives_as_the_op_holds_it(monkeypatch):
+    """The manifest defaults ``eps`` to null, and the builder is handed ``None``."""
+    import tileops_cpu.ops.rms_norm as module
 
-    def record(self, normalized_shape, eps, dtype):
-        seen["eps"] = eps
-        original(self, normalized_shape, eps, dtype)
+    seen = []
+    original = module.CpuRMSNorm
 
-    CpuRMSNorm.__init__ = record
-    try:
-        RMSNormFwdOp(normalized_shape=(N,))(
-            torch.randn(4, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16))
-    finally:
-        CpuRMSNorm.__init__ = original
+    def record(normalized_shape, eps, dtype):
+        seen.append(eps)
+        return original(normalized_shape, eps, dtype)
 
-    assert seen["eps"] == 1e-6
+    monkeypatch.setattr(module, "CpuRMSNorm", record)
+    x, weight = torch.randn(4, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16)
+
+    out = RMSNormFwdOp(normalized_shape=(N,))(x, weight)
+    torch.testing.assert_close(out, _ref(x, weight), rtol=1e-3, atol=1e-3)
+    RMSNormFwdOp(normalized_shape=(N,), eps=1e-5)(x, weight)
+
+    assert seen == [torch.finfo(torch.float32).eps, 1e-5], "None is the ref_api default"
+
+
+def test_an_omitted_weight_arrives_as_none():
+    """``weight`` is optional in the manifest: its slot stays, holding ``None``."""
+    x = torch.randn(4, N, dtype=torch.float16)
+    op = RMSNormFwdOp(normalized_shape=(N,))
+
+    out = op(x)
+
+    torch.testing.assert_close(out, _ref(x, None), rtol=1e-3, atol=1e-3)
+    (key,) = op.built_kernels("rms_norm")
+    assert key[1:] == ((torch.float16, (4, N)), None), "the absent input keys as None"
 
 
 def test_a_non_contiguous_input_reaches_the_kernel_contiguous():
@@ -96,28 +109,22 @@ def test_the_output_does_not_alias_an_input():
     torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
-@requires_cuda_runtime
 def test_a_second_op_is_served_by_its_own_builder():
-    """Two registrations, two builders: the op decides which one it asks for.
-
-    Marked for a CUDA driver because ``GemmFwdOp`` reads the SM version on the way to the
-    get-kernel call site, not because anything here runs on a GPU.
-    """
+    """Two registrations, two builders: the op decides which one it asks for."""
     a = torch.randn(64, 32, dtype=torch.float16)
     b = torch.randn(48, 32, dtype=torch.float16)   # NT by default: b is [N, K]
 
     op = GemmFwdOp()
     out = op(a, b)
 
-    assert op._settled_target == TARGET
-    assert isinstance(next(iter(op.built_kernels("gemm_kernel").values())), CpuGemm)
+    assert op.settled_target == TARGET
+    assert isinstance(next(iter(op.built_kernels("gemm").values())), CpuGemm)
     torch.testing.assert_close(out, (a.float() @ b.float().t()).half(), rtol=1e-2, atol=1e-2)
 
 
-@requires_cuda_runtime
 def test_builtin_escapes_the_target():
-    """``target=BUILTIN`` asks for the in-tree kernel, which is CUDA-only, and says so."""
+    """``target=BUILTIN`` asks for the in-tree kernels, which do not run on CPU, and says so."""
     op = RMSNormFwdOp(normalized_shape=(N,), target=BUILTIN)
 
-    with pytest.raises(ValueError, match="CUDA kernel"):
+    with pytest.raises(OpNotAvailableError, match="in-tree kernels do not run on cpu"):
         op(torch.randn(4, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16))
