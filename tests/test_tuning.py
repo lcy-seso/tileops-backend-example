@@ -16,6 +16,8 @@ from tileops.ops.norm.rms_norm import RMSNormFwdOp
 from tileops_cpu.ops.rms_norm import CpuRMSNorm
 
 N = 64
+# The warning TileOPs gives when a tuning request reaches a kernel without request_tune().
+UNTUNABLE = ".*defines no request_tune"
 
 
 def _run(op, rows):
@@ -49,7 +51,7 @@ def test_each_request_reaches_the_kernels_built_so_far(record):
     (kernel,) = op.built_entries("rms_norm").values()
 
     with warnings.catch_warnings():
-        warnings.simplefilter("error")   # a kernel defining request_tune draws no warning
+        warnings.filterwarnings("error", message=UNTUNABLE)
         op.request_tune()
         op.request_tune()
 
@@ -60,10 +62,12 @@ def test_each_request_reaches_the_kernels_built_so_far(record):
 def test_a_kernel_built_after_the_request_is_tuned_before_its_first_call(record):
     tunes, tuned_at_first_call = record
     op = RMSNormFwdOp(normalized_shape=(N,))
-    op.request_tune()
 
-    _run(op, 4)
-    _run(op, 8)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=UNTUNABLE)
+        op.request_tune()
+        _run(op, 4)
+        _run(op, 8)
 
     kernels = list(op.built_entries("rms_norm").values())
     assert len(kernels) == 2
