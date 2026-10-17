@@ -54,8 +54,9 @@ def build_gemm(a, b, *, trans_a, trans_b):
 
     Same rule as every builder: the signature is the op's manifest signature. ``m``, ``n``
     and ``k`` are readable from ``a.shape`` and ``b.shape`` if a backend wants to
-    specialize on them; this one does not, so it builds one kernel per dtype and transpose
-    pair regardless of shape.
+    specialize on them. This one does not: it returns the same kind of ``CpuGemm`` for every
+    shape. TileOPs still calls it once per device and input signature, and keeps each
+    kernel it returns under that signature.
 
     Args:
         a: Left operand.

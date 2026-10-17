@@ -269,7 +269,7 @@ set_default_target("torch_cpu")      # 进程默认,优先于设备探测
 set_default_target(BUILTIN)          # 全局关闭替换
 ```
 
-target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 设备探测。选定的 target 可从 `op.serving_target` 读出,每个输入签名构造的 kernel 可从 `op.built_entries(<interface>)` 读出。不存在「默认 target」这一概念,默认状态是不替换。
+target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 设备探测。选定的 target 可从 `op.serving_target` 读出,每个输入签名构造的 kernel 可从 `op.built_entries(<interface>)` 读出。进程默认未设置时(`default_target()` 为 `None`)由设备探测决定:有 target 认领调用的设备就由它服务,没有就用仓内实现。
 
 ## <a id="s10"></a>10. 运行测试
 

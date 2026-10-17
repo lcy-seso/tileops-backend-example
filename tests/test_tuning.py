@@ -2,15 +2,18 @@
 
 The kernel ``build_kernel`` returns may define ``request_tune()`` and ``config``. The op
 layer calls the first while the op is in tuned mode, on the kernels already built and on
-each one built later, and ``op.kernel_config()`` reads the second.
+each one built later before its first call, and ``op.kernel_config()`` reads the second.
 """
 
 import warnings
 
+import pytest
 import torch
 
 from tileops.ops.gemm.gemm import GemmFwdOp
 from tileops.ops.norm.rms_norm import RMSNormFwdOp
+
+from tileops_cpu.ops.rms_norm import CpuRMSNorm
 
 N = 64
 
@@ -19,31 +22,52 @@ def _run(op, rows):
     op(torch.randn(rows, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16))
 
 
-def _kernels(op, interface):
-    return list(op.built_entries(interface).values())
+@pytest.fixture
+def record(monkeypatch):
+    """Count each kernel's ``request_tune()`` calls, and note whether it was tuned at its
+    first call."""
+    tunes, tuned_at_first_call = {}, {}
+    request_tune, call = CpuRMSNorm.request_tune, CpuRMSNorm.__call__
+
+    def counting_request_tune(kernel):
+        tunes[id(kernel)] = tunes.get(id(kernel), 0) + 1
+        request_tune(kernel)
+
+    def noting_call(kernel, *args, **kwargs):
+        tuned_at_first_call.setdefault(id(kernel), kernel.tuned)
+        return call(kernel, *args, **kwargs)
+
+    monkeypatch.setattr(CpuRMSNorm, "request_tune", counting_request_tune)
+    monkeypatch.setattr(CpuRMSNorm, "__call__", noting_call)
+    return tunes, tuned_at_first_call
 
 
-def test_a_request_reaches_the_kernels_built_so_far():
+def test_each_request_reaches_the_kernels_built_so_far(record):
+    tunes, _ = record
     op = RMSNormFwdOp(normalized_shape=(N,))
     _run(op, 4)
+    (kernel,) = op.built_entries("rms_norm").values()
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")   # a kernel defining request_tune draws no warning
         op.request_tune()
-        op.request_tune()                # a later request asks again; the kernel is idempotent
+        op.request_tune()
 
-    assert all(kernel.tuned for kernel in _kernels(op, "rms_norm"))
+    assert tunes[id(kernel)] == 2, "every request calls it again; the kernel is idempotent"
+    assert kernel.tuned
 
 
-def test_a_kernel_built_after_the_request_is_tuned_before_its_first_call():
+def test_a_kernel_built_after_the_request_is_tuned_before_its_first_call(record):
+    tunes, tuned_at_first_call = record
     op = RMSNormFwdOp(normalized_shape=(N,))
     op.request_tune()
 
     _run(op, 4)
     _run(op, 8)
 
-    kernels = _kernels(op, "rms_norm")
-    assert len(kernels) == 2 and all(kernel.tuned for kernel in kernels)
+    kernels = list(op.built_entries("rms_norm").values())
+    assert len(kernels) == 2
+    assert all(tunes[id(k)] == 1 and tuned_at_first_call[id(k)] for k in kernels)
 
 
 def test_kernel_config_reports_the_kernels_config():
