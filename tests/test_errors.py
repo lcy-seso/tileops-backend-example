@@ -29,13 +29,13 @@ def test_naming_a_target_nobody_registered():
         op(torch.randn(4, 8, dtype=F16), torch.randn(8, dtype=F16))
 
 
-def test_a_failed_call_settles_no_target():
+def test_a_failed_call_selects_no_target():
     """One rejected call must not aim the instance for the rest of its life."""
     op = RMSNormFwdOp(normalized_shape=(8,))
 
     with pytest.raises(ValueError):
         op(torch.randn(4, 9, dtype=F16), torch.randn(8, dtype=F16))
-    assert op.settled_target is None
+    assert op.serving_target is None
 
     op(torch.randn(4, 8, dtype=F16), torch.randn(8, dtype=F16))
-    assert op.settled_target == "torch_cpu"
+    assert op.serving_target == "torch_cpu"

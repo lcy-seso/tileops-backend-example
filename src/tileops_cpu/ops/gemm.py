@@ -29,6 +29,16 @@ class CpuGemm:
         self.trans_a = bool(trans_a)
         self.trans_b = bool(trans_b)
         self.dtype = dtype
+        self.tuned = False
+
+    @property
+    def config(self) -> dict:
+        """The compile-time choices this kernel was built with, for ``op.kernel_config()``."""
+        return {"trans_a": self.trans_a, "trans_b": self.trans_b}
+
+    def request_tune(self) -> None:
+        """Tune this kernel on the current device; idempotent. PyTorch has nothing to search."""
+        self.tuned = True
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         lhs = a.float().t() if self.trans_a else a.float()
@@ -44,8 +54,9 @@ def build_gemm(a, b, *, trans_a, trans_b):
 
     Same rule as every builder: the signature is the op's manifest signature. ``m``, ``n``
     and ``k`` are readable from ``a.shape`` and ``b.shape`` if a backend wants to
-    specialize on them; this one does not, so it builds one kernel per dtype and transpose
-    pair regardless of shape.
+    specialize on them. This one does not: it returns the same kind of ``CpuGemm`` for every
+    shape. TileOPs still calls it once per device and input signature, and keeps each
+    kernel it returns under that signature.
 
     Args:
         a: Left operand.
