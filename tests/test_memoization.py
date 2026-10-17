@@ -22,7 +22,7 @@ def test_the_same_input_signature_reuses_the_same_kernel():
     _run(op, 4)
     _run(op, 4)
 
-    built = op.built_kernels("rms_norm")
+    built = op.built_entries("rms_norm")
     assert len(built) == 1, "one build for one signature"
 
 
@@ -30,7 +30,7 @@ def test_the_key_is_the_device_then_dtype_and_shape_per_input():
     op = RMSNormFwdOp(normalized_shape=(N,))
     _run(op, 4)
 
-    (key,) = op.built_kernels("rms_norm")
+    (key,) = op.built_entries("rms_norm")
     device, *inputs = key
     assert device.type == "cpu", "the device a kernel was built for is part of the key"
     assert inputs == [(torch.float16, (4, N)), (torch.float16, (N,))], "x then weight"
@@ -42,7 +42,7 @@ def test_a_new_shape_asks_the_builder_again():
     _run(op, 4)
     _run(op, 8)
 
-    built = op.built_kernels("rms_norm")
+    built = op.built_entries("rms_norm")
     assert len(built) == 2
     assert len({id(k) for k in built.values()}) == 2, "distinct kernels, not one reused"
 
@@ -53,7 +53,7 @@ def test_a_new_dtype_asks_the_builder_again():
     _run(op, 4, torch.float16)
     _run(op, 4, torch.bfloat16)
 
-    assert len(op.built_kernels("rms_norm")) == 2
+    assert len(op.built_entries("rms_norm")) == 2
 
 
 def test_each_op_instance_memoizes_on_its_own():
@@ -62,5 +62,5 @@ def test_each_op_instance_memoizes_on_its_own():
     _run(first, 4)
     _run(second, 4)
 
-    assert len(first.built_kernels("rms_norm")) == 1
-    assert len(second.built_kernels("rms_norm")) == 1
+    assert len(first.built_entries("rms_norm")) == 1
+    assert len(second.built_entries("rms_norm")) == 1

@@ -29,6 +29,16 @@ class CpuGemm:
         self.trans_a = bool(trans_a)
         self.trans_b = bool(trans_b)
         self.dtype = dtype
+        self.tuned = False
+
+    @property
+    def config(self) -> dict:
+        """The compile-time choices this kernel was built with, for ``op.kernel_config()``."""
+        return {"trans_a": self.trans_a, "trans_b": self.trans_b}
+
+    def request_tune(self) -> None:
+        """Tune this kernel on the current device; idempotent. PyTorch has nothing to search."""
+        self.tuned = True
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         lhs = a.float().t() if self.trans_a else a.float()

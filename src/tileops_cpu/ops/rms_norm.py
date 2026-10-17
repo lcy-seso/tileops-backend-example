@@ -10,6 +10,9 @@ shape every kernel class:
   ``signature.inputs`` order. Re-checking them here would duplicate a contract that lives in
   the manifest. Parameters arrive as the op instance holds them, so a manifest default of
   null arrives as ``None`` and the builder decides what it means.
+
+The kernel may also define ``request_tune()`` and ``config``, which the op layer reaches
+through ``op.request_tune()`` and ``op.kernel_config()``. Both are optional.
 """
 
 import math
@@ -53,6 +56,22 @@ class CpuRMSNorm:
         # module docstring.
         self._axes = tuple(range(-len(self.normalized_shape), 0))
         self._elems = math.prod(self.normalized_shape)
+        self.tuned = False
+
+    @property
+    def config(self) -> dict:
+        """The compile-time choices this kernel was built with, for ``op.kernel_config()``."""
+        return {"normalized_shape": self.normalized_shape, "eps": self.eps}
+
+    def request_tune(self) -> None:
+        """Tune this kernel on the current device, the one it was built for.
+
+        The op layer calls it while the op is in tuned mode, and again on every later
+        request, so it is idempotent. PyTorch has nothing to search; a real backend runs its
+        tuner here, or defers it to the next launch, which then completes before any CUDA
+        graph capture.
+        """
+        self.tuned = True
 
     def __call__(self, x: torch.Tensor, weight: "torch.Tensor | None") -> torch.Tensor:
         """Run one call.

@@ -109,6 +109,7 @@ for op, build_kernel in BUILDERS.items():
 | `tests/test_discovery.py` | entry point 与注册 |
 | `tests/test_errors.py` | 三条错误路径 |
 | `tests/test_memoization.py` | 何时重新调用 `build_kernel` |
+| `tests/test_tuning.py` | 调优请求与 `config` 到达 kernel |
 
 一个 op 的 kernel 与它的 builder 放在同一个模块里:两者一起改动,而 builder 的签名就是这个 op 的 manifest 签名。
 
@@ -142,6 +143,22 @@ def build_rms_norm(x: TensorSpec, weight: TensorSpec | None, *, normalized_shape
 - **`TensorSpec` 是描述而非张量**,只有 `device` / `dtype` / `shape`,既没有数据,也没有对张量的引用。这样两类错误就无法写出来:一是根据数据内容决定构造哪个 kernel(而记忆表按形状索引,后续会取到错误的 kernel),二是让某个张量随被缓存的 kernel 存活整个进程。
 
 对返回值只有一条要求:**可调用**。调用时按同样顺序收到真实张量(`forward` 若接收 `out` 这类输出缓冲区,则按关键字另外传入),返回值按 `signature.outputs` —— 单输出返回张量,多输出按顺序返回 tuple,纯原地写返回 `None`。
+
+返回的 kernel 还可以定义两个成员,含义与仓内 `Kernel` 的同名成员相同。两者都是可选的:
+
+| 成员 | op 层如何使用 |
+| --- | --- |
+| `request_tune()` | op 处于调优模式时调用:`op.request_tune()` 调用时作用于已构造的 kernel,之后构造的 kernel 在第一次调用前收到。每次请求对每个 kernel 按它被构造的设备各调用一次,调用时该设备是当前设备 |
+| `config` | 非空 dict。op 自己没有非空 config 时,`op.kernel_config()` 返回第一个非空的 kernel `config` |
+
+`request_tune()` 遵守四条规则:
+
+- 后续的请求会再次调用它,所以它对每个设备是幂等的。
+- 可以立即调优,也可以推迟到下一次启动;推迟的调优在 CUDA graph 捕获之前的一次调用中完成(见第 11 节)。
+- 它抛出的异常就是触发它的那次调用的异常,或 `op.request_tune()` 的异常。构造时调优失败的 kernel 不会被记住,下一次调用会重新构造。
+- kernel 没有定义它时,调优请求到达这个 kernel 会让 op 警告一次。
+
+本仓库的两个 kernel 都定义了这两个成员:`config` 报告构造时定下的编译期参数;PyTorch 没有可搜索的配置,`request_tune()` 只记下自己已被调用。真实后端在 `request_tune()` 里运行自己的调优。
 
 **构造签名只接收编译期参数。** 会被编译进生成代码的值(tile 尺寸、当作常量的维度、dtype)放进构造函数,其余留给 `__call__`。这一条对 decode 是硬性要求:`seq_len` 逐步递增,batch 随 running set 变化,它们进入构造函数就意味着每步重新编译。`ops/rms_norm.py` 中的 `CpuRMSNorm` 在构造时**拿不到行数**,原因即在于此。
 
@@ -252,7 +269,7 @@ set_default_target("torch_cpu")      # 进程默认,优先于设备探测
 set_default_target(BUILTIN)          # 全局关闭替换
 ```
 
-target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 设备探测。选定的 target 可从 `op.settled_target` 读出。不存在「默认 target」这一概念,默认状态是不替换。
+target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 设备探测。选定的 target 可从 `op.serving_target` 读出,每个输入签名构造的 kernel 可从 `op.built_entries(<interface>)` 读出。不存在「默认 target」这一概念,默认状态是不替换。
 
 ## <a id="s10"></a>10. 运行测试
 
@@ -260,14 +277,14 @@ target 的选取顺序:构造参数 `target=`(仅关键字)→ 进程默认 → 
 
 ```bash
 pip install -e .          # tileops 已安装时加 --no-deps
-python -m pytest -q       # 有无 GPU 都是 24 passed,见 7.1
+python -m pytest -q       # 有无 GPU 都是 28 passed,见 7.1
 ```
 
 在 TileOPs 的 dev 镜像中运行,同样不需要修改 TileOPs:
 
 ```bash
 docker run --rm --gpus all -v "$PWD/..":/work -w /work \
-  ghcr.io/tile-ai/tileops-runner:cu132-torch2.13-tl-afcebed1-dev \
+  ghcr.io/tile-ai/tileops-dev:cuda13.2-torch2.13-tilelang0.1.12 \
   bash -lc 'pip install -e /work/TileOPs --no-deps -q &&
             pip install -e /work/tileops-backend-example --no-deps -q &&
             cd /work/tileops-backend-example && python -m pytest -q'
@@ -284,6 +301,7 @@ decode 路径会被 CUDA graph 捕获,各阶段允许做的事因此分别规定
 | 查记忆表 | dict 查找 | 其余一切 |
 | `detect` | 一次谓词判断 | 任何 import、任何加锁 |
 | 构造 kernel | 选实现、编译、分配、重 import、建 handle | 依赖真实张量的调优 |
+| kernel 的 `request_tune()` | 编译、分配、计时 | 依赖调用方真实张量的调优 |
 | kernel 调用 | 启动已编译的 kernel;经 torch allocator 分配输出 | 编译、惰性初始化、建 handle、host 同步 |
 
 **模块顶层 import 不得触发编译。** TileOPs 在构造第一个 Op 时 import 后端模块,编译应发生在 `build_kernel` 被调用时。
@@ -293,7 +311,7 @@ kernel 调用还须满足两条与流相关的规则:
 - **在当前流上启动**(CUDA 下即 `torch.cuda.current_stream(device)`),不得落到默认流。自带 launcher 的后端尤其容易违反这一条。
 - **内部分配的生命周期必须跨越异步执行。** 只把裸指针交给 launch 时,对象必须存活到该流执行完成。协议不提供 workspace,这份安全由后端负责。
 
-调用方须在捕获前完成预热(至少一次同形状的非捕获调用),因为构造 kernel 允许编译。捕获期间只允许走「查表命中、直接调用」这条路。
+调用方须在捕获前完成预热(至少一次同形状的非捕获调用),因为构造 kernel 允许编译。`op.request_tune()` 之后同样如此:每个形状在捕获前再做一次非捕获调用,推迟到启动时的调优在这次调用中完成。捕获期间只允许走「查表命中、直接调用」这条路。
 
 ## <a id="s12"></a>12. 不支持的情形
 
@@ -313,5 +331,5 @@ kernel 调用还须满足两条与流相关的规则:
 2. 修改 `target.py` 的 `detect`,认领对应的设备类型
 3. 选定第一个要接管的 op,新建 `ops/<名字>.py`:kernel 构造时编译、`__call__` 时启动,builder 照该 op 的 manifest 签名写
 4. 在 `ops/__init__.py` 的 `BUILDERS` 里加一行,键用 manifest 的键
-5. `tests/` 中的四个文件基本可以直接沿用,替换 op 名与 target 名即可
+5. `tests/` 中的五个文件基本可以直接沿用,替换 op 名与 target 名即可
 6. 之后逐个 op 重复第 3、4 步。**目标模型用到的 op 需要全部覆盖**,缺少任何一个都会报错

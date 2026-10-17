@@ -39,8 +39,8 @@ def test_the_target_is_what_served_it():
     op = RMSNormFwdOp(normalized_shape=(N,))
     op(torch.randn(4, N, dtype=torch.float16), torch.randn(N, dtype=torch.float16))
 
-    assert op.settled_target == TARGET
-    assert isinstance(next(iter(op.built_kernels("rms_norm").values())), CpuRMSNorm)
+    assert op.serving_target == TARGET
+    assert isinstance(next(iter(op.built_entries("rms_norm").values())), CpuRMSNorm)
 
 
 def test_eps_arrives_as_the_op_holds_it(monkeypatch):
@@ -72,7 +72,7 @@ def test_an_omitted_weight_arrives_as_none():
     out = op(x)
 
     torch.testing.assert_close(out, _ref(x, None), rtol=1e-3, atol=1e-3)
-    (key,) = op.built_kernels("rms_norm")
+    (key,) = op.built_entries("rms_norm")
     assert key[1:] == ((torch.float16, (4, N)), None), "the absent input keys as None"
 
 
@@ -117,8 +117,8 @@ def test_a_second_op_is_served_by_its_own_builder():
     op = GemmFwdOp()
     out = op(a, b)
 
-    assert op.settled_target == TARGET
-    assert isinstance(next(iter(op.built_kernels("gemm").values())), CpuGemm)
+    assert op.serving_target == TARGET
+    assert isinstance(next(iter(op.built_entries("gemm").values())), CpuGemm)
     torch.testing.assert_close(out, (a.float() @ b.float().t()).half(), rtol=1e-2, atol=1e-2)
 
 
